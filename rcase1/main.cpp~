@@ -1,0 +1,675 @@
+#define _USE_MATH_DEFINES
+#define STB_IMAGE_IMPLEMENTATION
+#include <iostream>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include <limits>
+#include <chrono>
+#include <array>
+#include "stb_image.h"
+using namespace std;
+
+// Keep values between min and max
+template<typename T> T Clamp(T v, T lo, T hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
+
+// Find smallest of 3 numbers
+float min3(float a, float b, float c) { return min(a, min(b, c)); }
+
+// Find largest of 3 numbers
+float max3(float a, float b, float c) { return max(a, max(b, c)); }
+
+// Color with red, green, blue values (0-255)
+struct Color {
+    uint8_t r,g,b;
+    Color() : r(0), g(0), b(0) {}
+    Color(uint8_t rr, uint8_t gg, uint8_t bb) : r(rr), g(gg), b(bb) {}
+    // Multiply color by a number (for lighting)
+    Color operator*(float s) const {
+        return Color(
+            (uint8_t)Clamp(r * s, 0.0f, 255.0f),
+            (uint8_t)Clamp(g * s, 0.0f, 255.0f),
+            (uint8_t)Clamp(b * s, 0.0f, 255.0f)
+        );
+    }
+    // Add two colors together
+    Color operator+(const Color& o) const {
+        return Color(
+            (uint8_t)Clamp((int)r + (int)o.r, 0, 255),
+            (uint8_t)Clamp((int)g + (int)o.g, 0, 255),
+            (uint8_t)Clamp((int)b + (int)o.b, 0, 255)
+        );
+    }
+};
+
+// --- NEW: Compute perceived brightness ---
+float Brightness(const Color& c) {
+    return (0.299f * c.r + 0.587f * c.g + 0.114f * c.b) / 255.0f;
+}
+
+// Image with pixels and depth buffer for 3D rendering
+struct Image {
+    int W,H;
+    std::vector<Color> pix;
+    std::vector<float> zbuf;
+    explicit Image(int w,int h,Color bg=Color(0,0,0)) // Background color
+        : W(w), H(h), pix(w*h,bg), zbuf(w*h,std::numeric_limits<float>::infinity()) {}
+    void PutPixel(int x, int y, float z, Color c) {
+        if(x<0||x>=W||y<0||y>=H) return;
+        int idx=y*W+x;
+        if(z<zbuf[idx]) { zbuf[idx]=z; pix[idx]=c; }
+    }
+    void SavePPM(const std::string& path) {
+        std::ofstream f(path);
+        f << "P3\n" << W << " " << H << "\n255\n";
+        for (auto& p : pix) f << (int)p.r << " " << (int)p.g << " " << (int)p.b << "\n";
+        std::cout << "Saved: " << path << std::endl;
+    }
+};
+
+// --- NEW: Compute shadow metrics for rasterizer ---
+void ComputeShadowMetrics(const struct Image& img, double renderTimeMs) {
+    int shadowCount = 0;
+    for (auto& c : img.pix) {
+        if (Brightness(c) < 0.30f) shadowCount++;
+    }
+    double shadowRatio = 100.0 * shadowCount / (img.W * img.H);
+    double pixelsPerSec = img.W * img.H / (renderTimeMs / 1000.0);
+
+    std::cout << "\n=== SHADOW METRICS ===" << std::endl;
+    std::cout << "Shadow pixels (brightness < 0.30): " << shadowCount << std::endl;
+    std::cout << "Shadow area ratio: " << shadowRatio << " %" << std::endl;
+    std::cout << "Pixels per second: " << pixelsPerSec << std::endl;
+}
+
+// 2D point for texture coordinates (u,v)
+struct Vec2f { float u,v; Vec2f() : u(0), v(0) {} Vec2f(float uu, float vv) : u(uu), v(vv) {} };
+
+// 3D point with x,y,z coordinates
+struct Vec3f {
+    float x,y,z;
+    Vec3f() : x(0), y(0), z(0) {}
+    Vec3f(float xx, float yy, float zz) : x(xx), y(yy), z(zz) {}
+    Vec3f operator+(const Vec3f& o) const { return {x+o.x, y+o.y, z+o.z}; }
+    Vec3f operator-(const Vec3f& o) const { return {x-o.x, y-o.y, z-o.z}; }
+    Vec3f operator*(float s) const { return {x*s, y*s, z*s}; }
+    Vec3f operator/(float s) const { return {x/s, y/s, z/s}; }
+    float length() const { return sqrtf(x*x + y*y + z*z); }
+};
+
+// Dot product of two vectors
+float dot(Vec3f a, Vec3f b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+
+// Cross product of two vectors gives perpendicular vector
+Vec3f cross(Vec3f a, Vec3f b) { return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x }; }
+
+// Make vector length = 1 (normalize it)
+Vec3f normalize(Vec3f v) { float l = v.length(); return (l > 0) ? v * (1.0f/l) : v; }
+
+// Texture class to load and use image files
+struct Texture {
+    int width, height;
+    vector<Color> data;
+    Texture() : width(1), height(1), data(1, Color(255, 255, 255)) {}
+    Texture(const string& path) {
+        int channels;
+        unsigned char* img_data = stbi_load(path.c_str(), &width, &height, &channels, 3);
+        if (!img_data) {
+            cerr << "Failed to load texture: " << path << endl;
+            width = height = 1;
+            data = {Color(255, 0, 255)};
+            return;
+        }
+        data.resize(width * height);
+        for (int i = 0; i < width * height; i++) {
+            data[i] = Color(
+                img_data[i * 3],
+                img_data[i * 3 + 1],
+                img_data[i * 3 + 2]
+            );
+        }
+        stbi_image_free(img_data);
+        std::cout << "Loaded texture: " << path << " (" << width << "x" << height << ")" << endl;
+    }
+    Color Sample(float u, float v) const {
+        u = fmodf(u, 1.0f); if (u < 0) u += 1.0f;
+        v = fmodf(v, 1.0f); if (v < 0) v += 1.0f;
+        int x = (int)(u * (width - 1));
+        int y = (int)(v * (height - 1));
+        x = max(0, min(width - 1, x));
+        y = max(0, min(height - 1, y));
+        return data[y * width + x];
+    }
+};
+
+// Camera settings: position, where it looks, field of view, etc.
+struct Camera {
+    Vec3f position; // Where camera is in 3D space (x,y,z)
+    Vec3f target; // Where camera is looking (x,y,z)
+    Vec3f up; // Which way is up (usually 0,1,0)
+    float fov; // Field of view (how wide the view is)
+    float aspect; // Screen width/height ratio
+    float nearPlane; // Closest visible distance
+    float farPlane; // Farthest visible distance
+    Camera() : position(0,3,8), target(0,0,0), up(0,1,0), fov(60.0f), aspect(1.0f), nearPlane(0.1f), farPlane(100.0f) {}
+};
+
+// Triangle with 3 vertices, texture coordinates, and color
+struct Triangle {
+    int v0,v1,v2; // Vertex indices
+    Vec2f uv0,uv1,uv2; // Texture coordinates for each vertex
+    Color c; // Base color
+    Triangle() : v0(0), v1(0), v2(0), uv0(), uv1(), uv2(), c() {}
+    Triangle(int vv0, int vv1, int vv2, Vec2f u0, Vec2f u1, Vec2f u2, Color cc) : v0(vv0), v1(vv1), v2(vv2), uv0(u0), uv1(u1), uv2(u2), c(cc) {}
+};
+
+// 3D model with vertices and triangles
+struct Model {
+    vector<Vec3f> vertices; // All 3D points
+    vector<Triangle> triangles; // All triangles that make the shape
+};
+
+// Object in the scene: model + position + rotation + scale
+struct Instance {
+    const Model* model; // Which 3D model to use
+    Vec3f position; // Where to put it (x,y,z)
+    Vec3f rotation; // How to rotate it (x,y,z angles)
+    float scale; // How big to make it
+    const Texture* texture;// What texture to use
+    Color color;
+Instance(const Model* m, Vec3f pos, Vec3f rot, float s, const Texture* tex = nullptr, Color c = Color(255,255,255))
+    : model(m), position(pos), rotation(rot), scale(s), texture(tex), color(c) {}
+
+};
+
+// Light source with position, direction, color and brightness
+struct Light {
+    Vec3f position;   // Light position in world space
+    Vec3f direction;  // Where the light is pointing (for spotlights or directional lights)
+    Color color;
+    float intensity;
+
+    Light() : position(0,8,3), direction(0,-1,-0.5), color(255,255,255), intensity(1.8f) {}
+    Light(Vec3f pos, Vec3f dir, Color c, float i = 1.0f)
+        : position(pos), direction(normalize(dir)), color(c), intensity(i) {}
+};
+
+// How surfaces react to light: ambient, diffuse, specular
+struct ShadingParams {
+    float ambient; // Base brightness (always there)
+    float diffuse; // Light from direct source
+    float specular; // Shiny highlights
+    float shininess; // How sharp the highlights are
+    ShadingParams() : ambient(0.5f), diffuse(1.0f), specular(0.3f), shininess(32.0f) {}
+    ShadingParams(float a, float d, float s, float sh) : ambient(a), diffuse(d), specular(s), shininess(sh) {}
+};
+
+// ---- START: Added shadowing functions ----
+
+// Simple sphere intersection for shadows
+bool IntersectSphere(const Vec3f& rayOrig, const Vec3f& rayDir, const Vec3f& center, float radius) {
+    Vec3f L = center - rayOrig;
+    float tca = dot(L, rayDir);
+    if (tca < 0) return false;
+    float d2 = dot(L,L) - tca*tca;
+    return d2 <= radius*radius;
+}
+
+// Check if point is in shadow given all spheres
+float ShadowFactor(const Vec3f& fragPos, const Vec3f& lightPos, const vector<Instance>& scene) {
+    Vec3f L = normalize(lightPos - fragPos);
+    for (auto& inst : scene) {
+        if (!inst.model) continue;
+
+        // assume spheres only
+        Vec3f sphereCenter = inst.position + Vec3f(0, 0, 0); // your spheres are centered at inst.position
+        float sphereRadius = 0.5f * inst.scale;
+
+        if (IntersectSphere(fragPos, L, sphereCenter, sphereRadius))
+            return 0.3f;
+    }
+    return 1.0f;
+}
+
+// ---- END: Added shadowing functions ----
+
+// Multiply 3D point by 4x4 matrix (for 3D transformations)
+void MultiplyMatrixVector(const Vec3f& i, Vec3f& o, const float m[4][4]) {
+    o.x = i.x * m[0][0] + i.y * m[1][0] + i.z * m[2][0] + m[3][0];
+    o.y = i.x * m[0][1] + i.y * m[1][1] + i.z * m[2][1] + m[3][1];
+    o.z = i.x * m[0][2] + i.y * m[1][2] + i.z * m[2][2] + m[3][2];
+    float w = i.x * m[0][3] + i.y * m[1][3] + i.z * m[2][3] + m[3][3];
+    if (w != 0.0f) { o.x /= w; o.y /= w; o.z /= w; }
+}
+
+// Create view matrix from camera position and orientation
+void BuildViewMatrix(const Camera& cam, float view[4][4]) {
+    Vec3f forward = normalize(cam.target - cam.position);
+    Vec3f right = normalize(cross(forward, cam.up));
+    Vec3f up = normalize(cross(right, forward));
+    view[0][0] = right.x; view[0][1] = up.x; view[0][2] = -forward.x; view[0][3] = 0;
+    view[1][0] = right.y; view[1][1] = up.y; view[1][2] = -forward.y; view[1][3] = 0;
+    view[2][0] = right.z; view[2][1] = up.z; view[2][2] = -forward.z; view[2][3] = 0;
+    view[3][0] = -dot(cam.position, right); view[3][1] = -dot(cam.position, up); view[3][2] = dot(cam.position, forward); view[3][3] = 1;
+}
+
+// Create projection matrix for 3D perspective
+void BuildProjMatrix(const Camera& cam, float proj[4][4]) {
+    float fovRad = cam.fov * M_PI / 180.0f;
+    float f = 1.0f / tan(fovRad / 2.0f);
+    float aspect = cam.aspect;
+    proj[0][0] = f / aspect; proj[0][1] = 0; proj[0][2] = 0; proj[0][3] = 0;
+    proj[1][0] = 0; proj[1][1] = -f; proj[1][2] = 0; proj[1][3] = 0; // Negative f fixes Y inversion
+    proj[2][0] = 0; proj[2][1] = 0; proj[2][2] = cam.farPlane / (cam.farPlane - cam.nearPlane); proj[2][3] = 1;
+    proj[3][0] = 0; proj[3][1] = 0; proj[3][2] = (-cam.farPlane * cam.nearPlane) / (cam.farPlane - cam.nearPlane); proj[3][3] = 0;
+}
+
+// Convert 3D point to 2D screen coordinates
+Vec3f ProjectVertex(const Vec3f& vertex, const float view[4][4], const float proj[4][4], int screenWidth, int screenHeight) {
+    Vec3f viewSpace, projSpace;
+    MultiplyMatrixVector(vertex, viewSpace, view);
+    MultiplyMatrixVector(viewSpace, projSpace, proj);
+    // Convert from -1 to 1 range to screen coordinates
+    Vec3f screen;
+    screen.x = (projSpace.x + 1.0f) * 0.5f * screenWidth;
+    screen.y = (1.0f - projSpace.y) * 0.5f * screenHeight; // Flip Y so 0 is top
+    screen.z = projSpace.z;
+    return screen;
+}
+
+// Multiply 3D point by 3x3 rotation matrix
+Vec3f MulMat3(const float M[3][3], Vec3f v){ 
+    return Vec3f(
+        M[0][0]*v.x + M[0][1]*v.y + M[0][2]*v.z,
+        M[1][0]*v.x + M[1][1]*v.y + M[1][2]*v.z,
+        M[2][0]*v.x + M[2][1]*v.y + M[2][2]*v.z
+    ); 
+} 
+
+// Build rotation matrix from X,Y,Z rotation angles
+void BuildRzyx(float rx,float ry,float rz,float R[3][3]){ 
+    float cx=cosf(rx),sx=sinf(rx); 
+    float cy=cosf(ry),sy=sinf(ry); 
+    float cz=cosf(rz),sz=sinf(rz); 
+
+    float Rx[3][3]={{1,0,0},{0,cx,-sx},{0,sx,cx}}; 
+    float Ry[3][3]={{cy,0,sy},{0,1,0},{-sy,0,cy}}; 
+    float Rz[3][3]={{cz,-sz,0},{sz,cz,0},{0,0,1}}; 
+
+    // Matrix multiplication: R = Rz * Ry * Rx
+    auto mul=[&](float A[3][3],float B[3][3],float O[3][3]){ 
+        for(int i=0;i<3;i++)
+            for(int j=0;j<3;j++){
+                O[i][j]=0;
+                for(int k=0;k<3;k++)
+                    O[i][j]+=A[i][k]*B[k][j];
+            }
+    }; 
+
+    float T[3][3]; 
+    mul(Rz,Ry,T); 
+    mul(T,Rx,R); 
+} 
+
+// Check if triangle faces away from camera (for culling)
+bool BackFace(const Vec3f& a, const Vec3f& b, const Vec3f& c, const Vec3f& viewDir){ 
+    Vec3f n = cross(b-a, c-a); 
+    return dot(n, viewDir) < -0.2f; // Only cull if strongly facing away
+} 
+
+// Calculate color with lighting: ambient + diffuse + specular
+Color Shade(Color base, Vec3f N, Vec3f L, Vec3f V, const Light& light, const ShadingParams& sp){ 
+    N = normalize(N);  // Surface normal
+    L = normalize(L);  // Light direction  
+    V = normalize(V);  // View direction
+    Vec3f H = normalize(L + V); // Half vector for specular
+    float diff = max(0.0f, dot(N, L)); // Diffuse intensity
+    float spec = powf(max(0.0f, dot(N, H)), sp.shininess); // Specular intensity
+    float shade = sp.ambient + (sp.diffuse * diff + sp.specular * spec) * light.intensity; 
+    
+    // Multiply base by light color
+    return Color(
+        (uint8_t)Clamp(base.r * light.color.r / 255.0f * shade, 0.0f, 255.0f),
+        (uint8_t)Clamp(base.g * light.color.g / 255.0f * shade, 0.0f, 255.0f),
+        (uint8_t)Clamp(base.b * light.color.b / 255.0f * shade, 0.0f, 255.0f)
+    );
+} 
+
+
+// Draw filled triangle with texture, shading, and shadows
+void DrawTriangle(
+    const Vec3f& p0, const Vec3f& p1, const Vec3f& p2,      // SCREEN space
+    const Vec3f& wp0, const Vec3f& wp1, const Vec3f& wp2,  // WORLD space
+    const Vec2f& uv0, const Vec2f& uv1, const Vec2f& uv2,
+    Color base_color, const Texture* texture, Image& img,
+    const Vec3f& world_normal, const Light& light, const ShadingParams& sp,
+    const Vec3f& camPos,
+    const vector<Instance>& scene) // needed for shadows
+{
+    // bounding box in screen coordinates
+    int minX = (int)max(0.0f, min3(p0.x, p1.x, p2.x));
+    int maxX = (int)min((float)img.W-1, max3(p0.x, p1.x, p2.x));
+    int minY = (int)max(0.0f, min3(p0.y, p1.y, p2.y));
+    int maxY = (int)min((float)img.H-1, max3(p0.y, p1.y, p2.y));
+    if (minX > maxX || minY > maxY) return;
+
+    // area for barycentric
+    float area = (p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y);
+    if (fabs(area) < 1e-8f) return;
+    float invArea = 1.0f / area;
+
+    // rasterize
+    for (int y = minY; y <= maxY; ++y) {
+        for (int x = minX; x <= maxX; ++x) {
+            // barycentric numerators
+            float w0 = (p1.x - x) * (p2.y - y) - (p2.x - x) * (p1.y - y);
+            float w1 = (p2.x - x) * (p0.y - y) - (p0.x - x) * (p2.y - y);
+            float w2 = (p0.x - x) * (p1.y - y) - (p1.x - x) * (p0.y - y);
+
+            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+                w0 *= invArea; w1 *= invArea; w2 *= invArea;
+
+                // interpolated screen-space depth (z)
+                float z = p0.z * w0 + p1.z * w1 + p2.z * w2;
+
+                // z-buffer test
+                int idx = y * img.W + x;
+                if (z >= img.zbuf[idx]) continue;
+
+                // interpolate texture coords
+                float u = uv0.u * w0 + uv1.u * w1 + uv2.u * w2;
+                float v = uv0.v * w0 + uv1.v * w1 + uv2.v * w2;
+
+                // base color from texture or constant
+                Color pixel_color = texture ? texture->Sample(u, v) : base_color;
+
+                // ------ lighting: use world-space positions for correct L and V ------
+                Vec3f frag_pos = wp0 * w0 + wp1 * w1 + wp2 * w2;   // world-space fragment position
+                Vec3f L_dir = normalize(light.position - frag_pos); // from fragment to light
+                Vec3f V_dir = normalize(camPos - frag_pos);         // from fragment to camera/viewer
+
+                // calculate shaded color
+                Color shaded_color = Shade(pixel_color, world_normal, L_dir, V_dir, light, sp);
+
+                // ------ apply shadow factor ------
+                float shadow = ShadowFactor(frag_pos, light.position, scene); // returns 0-1
+                shaded_color = shaded_color * shadow;
+
+                // write pixel and depth
+                img.PutPixel(x, y, z, shaded_color);
+            }
+        }
+    }
+}
+
+
+// Create sphere model with given radius and resolution
+Model MakeSphere(float r, int nLat, int nLon) { 
+    Model m; 
+
+    // Create vertices in spherical coordinates
+    for (int i = 0; i <= nLat; i++) { 
+        float v = i / float(nLat);  // 0 to 1 from top to bottom
+        float theta = v * M_PI;     // 0 to PI
+        for (int j = 0; j <= nLon; j++) { 
+            float u = j / float(nLon);  // 0 to 1 around sphere
+            float phi = u * 2 * M_PI;   // 0 to 2PI
+            // Convert spherical to Cartesian coordinates
+            float x = r * sin(theta) * cos(phi);
+            float y = r * cos(theta);
+            float z = r * sin(theta) * sin(phi);
+            m.vertices.push_back(Vec3f(x, y, z));
+        } 
+    } 
+
+    // Helper to get vertex index from grid position
+    auto idx = [&](int i, int j) { return i * (nLon + 1) + j; };
+
+    // Create triangles from grid
+    for (int i = 0; i < nLat; i++) {
+        for (int j = 0; j < nLon; j++) {
+            int a = idx(i, j);
+            int b = idx(i, j + 1);
+            int c = idx(i + 1, j + 1);
+            int d = idx(i + 1, j);
+
+            // Texture coordinates for spherical mapping
+            Vec2f uv_a(j / float(nLon), i / float(nLat));
+            Vec2f uv_b((j + 1) / float(nLon), i / float(nLat));
+            Vec2f uv_c((j + 1) / float(nLon), (i + 1) / float(nLat));
+            Vec2f uv_d(j / float(nLon), (i + 1) / float(nLat));
+
+            // Two triangles per grid square
+            m.triangles.push_back(Triangle(a, b, c, uv_a, uv_b, uv_c, Color(240, 240, 255)));
+            m.triangles.push_back(Triangle(a, c, d, uv_a, uv_c, uv_d, Color(240, 240, 255)));
+        }
+    }
+
+    return m;
+}
+
+// Create floor as a flat rectangle
+Model MakeFloor(float size) {
+    Model m;
+
+    m.vertices = {
+        Vec3f(-size, 0 , -size),  // back-left
+        Vec3f(size,  0  , -size),   // back-right  
+        Vec3f(size,  0  , size),    // front-right
+        Vec3f(-size, 0 , size)    // front-left
+    };
+
+    Color floorColor = Color(200, 200, 200);
+    m.triangles = {
+        Triangle(0, 1, 2, Vec2f(0,0), Vec2f(1,0), Vec2f(1,1), floorColor),
+        Triangle(0, 2, 3, Vec2f(0,0), Vec2f(1,1), Vec2f(0,1), floorColor)
+    };
+    return m;
+}
+
+// Create back wall
+Model MakeBackWall(float width, float height) {
+    Model m;
+    m.vertices = {
+        Vec3f(-width, 0, -5),    // bottom-left
+        Vec3f(width, 0, -5),     // bottom-right
+        Vec3f(width, height, -5), // top-right
+        Vec3f(-width, height, -5) // top-left
+    };
+    m.triangles = {
+        Triangle(0, 1, 2, Vec2f(0,0), Vec2f(1,0), Vec2f(1,1), Color(150, 150, 200)),
+        Triangle(0, 2, 3, Vec2f(0,0), Vec2f(1,1), Vec2f(0,1), Color(150, 150, 200))
+    };
+    return m;
+}
+
+// Create left wall
+Model MakeLeftWall(float depth, float height) {
+    Model m;
+    m.vertices = {
+        Vec3f(-5, 0, depth),     // front-bottom
+        Vec3f(-5, 0, -depth),    // back-bottom
+        Vec3f(-5, height, -depth), // back-top
+        Vec3f(-5, height, depth)   // front-top
+    };
+    m.triangles = {
+        Triangle(0, 1, 2, Vec2f(0,0), Vec2f(1,0), Vec2f(1,1), Color(200, 150, 150)),
+        Triangle(0, 2, 3, Vec2f(0,0), Vec2f(1,1), Vec2f(0,1), Color(200, 150, 150))
+    };
+    return m;
+}
+
+// Create right wall
+Model MakeRightWall(float depth, float height) {
+    Model m;
+    m.vertices = {
+        Vec3f(5, 0, -depth),     // back-bottom
+        Vec3f(5, 0, depth),      // front-bottom
+        Vec3f(5, height, depth), // front-top
+        Vec3f(5, height, -depth) // back-top
+    };
+    m.triangles = {
+        Triangle(0, 1, 2, Vec2f(0,0), Vec2f(1,0), Vec2f(1,1), Color(150, 200, 150)),
+        Triangle(0, 2, 3, Vec2f(0,0), Vec2f(1,1), Vec2f(0,1), Color(150, 200, 150))
+    };
+    return m;
+}
+
+// Render one object in the scene
+void RenderInstance(
+    const Instance& inst, const Camera& cam, Image& img, 
+    const Light& light, const ShadingParams& sp, bool cull,
+    const vector<Instance>& scene) // <-- add this
+{ 
+    vector<Vec3f> projected;
+    vector<Vec3f> world;
+    projected.reserve(inst.model->vertices.size());
+    world.reserve(inst.model->vertices.size());
+
+    // Build rotation matrix from object's rotation angles
+    float Rm[3][3];
+    BuildRzyx(inst.rotation.x, inst.rotation.y, inst.rotation.z, Rm);
+    
+    // Build view and projection matrices
+    float view[4][4], proj[4][4];
+    BuildViewMatrix(cam, view);
+    BuildProjMatrix(cam, proj);
+
+    // Transform each vertex to world space and screen space
+    for (auto& V0 : inst.model->vertices) {
+        Vec3f worldPos = MulMat3(Rm, V0 * inst.scale) + inst.position;
+        world.push_back(worldPos);
+        projected.push_back(ProjectVertex(worldPos, view, proj, img.W, img.H));
+    }
+
+    // Calculate view direction for culling
+    Vec3f viewDir = normalize(cam.target - cam.position);
+
+    // Render each triangle
+    for (auto& T : inst.model->triangles) {
+
+        // ==== World-space vertices (for correct lighting) ====
+        Vec3f w0 = world[T.v0];
+        Vec3f w1 = world[T.v1];
+        Vec3f w2 = world[T.v2];
+
+        // ==== Screen-space vertices (for rasterization) ====
+        Vec3f p0 = projected[T.v0];
+        Vec3f p1 = projected[T.v1];
+        Vec3f p2 = projected[T.v2];
+
+        // FIX: Check if this is the floor model
+        bool isFloor = (inst.model->vertices.size() == 4);
+    
+        Vec3f normal;
+        if (isFloor) {
+            normal = Vec3f(0, 1, 0); // Floor normal points up
+        } else {
+            normal = normalize(cross(w1 - w0, w2 - w0)); // correct world normal
+        }
+
+        // FIX: Never cull the floor, only cull other objects if enabled
+        if (cull && !isFloor && BackFace(w0, w1, w2, viewDir))
+            continue;
+
+        // ======== Correct call to DrawTriangle (full lighting support) ========
+        Color baseColor = inst.texture ? T.c : inst.color;
+        DrawTriangle(p0, p1, p2, w0, w1, w2, T.uv0, T.uv1, T.uv2, baseColor, 
+        inst.texture, img, normal, light, sp, cam.position, scene);
+
+
+
+    }
+}
+
+// Render scene and measure how long it takes
+double RenderAndTime(
+    const vector<Instance>& scene, const Camera& cam, Image& img, 
+    const Light& light, const ShadingParams& sp, bool cull,
+    const string& name)
+{
+    auto t1 = chrono::high_resolution_clock::now(); 
+
+    // Always render floor first to make sure it's visible
+    for (auto& inst : scene) {
+        if (inst.model->vertices.size() == 4) { // Floor has 4 vertices
+            RenderInstance(inst, cam, img, light, sp, false, scene); // Never cull floor
+        }
+    }
+    
+    // Render other objects
+    for (auto& inst : scene) {
+        if (inst.model->vertices.size() != 4) { 
+            RenderInstance(inst, cam, img, light, sp, cull, scene);
+        }
+    }
+
+    auto t2 = chrono::high_resolution_clock::now(); 
+
+    double ms = chrono::duration<double, milli>(t2 - t1).count(); 
+
+    img.SavePPM(name); 
+
+    cerr << "Render " << name << " (" << (cull ? "optimizado" : "base") << "): " << ms << " ms\n"; 
+
+    return ms; 
+} 
+
+// Main function - setup and run everything
+int main() {
+    const int W = 800, H = 600;
+
+    Camera cam;
+    cam.position = Vec3f(0, 3, 8);
+    cam.target = Vec3f(0, 0, 0);
+    cam.up = Vec3f(0, 1, 0);
+    cam.fov = 60.0f;
+    cam.aspect = (float)W / H;
+    cam.nearPlane = 0.1f;
+    cam.farPlane = 100.0f;
+
+    Texture marbleTexture("marblePic.jpg");
+
+    Model backWall = MakeBackWall(5.0f, 10.0f);
+    Model leftWall = MakeLeftWall(5.0f, 10.0f);
+    Model rightWall = MakeRightWall(5.0f, 10.0f);
+    // Model floor = MakeFloor(10);
+
+    Model sphere = MakeSphere(0.5f, 20, 40);
+    Model sphere2 = MakeSphere(0.5f, 20, 40);
+    Model sphere3 = MakeSphere(0.5f, 20, 40);
+
+    vector<Instance> scene = {
+	// Instance(model, pos, rotation, scale, texture, color)
+        Instance(&backWall,  Vec3f(0,-2.5f,0), Vec3f(0,0,0), 1.0f, nullptr, Color(180, 200, 255)),
+        Instance(&leftWall,  Vec3f(0.5f,-2.0f,0), Vec3f(0,0,0), 1.0f, nullptr, Color(180, 200, 255)),
+        Instance(&rightWall, Vec3f(-0.5f,-2.0f,0), Vec3f(0,0,0), 1.0f, nullptr, Color(180, 200, 255)),
+        Instance(&sphere, Vec3f(-1.5f, 0.5f, 4.0f), Vec3f(0, 0, 0), 1.0f, nullptr, Color(255, 220, 200)),
+        Instance(&sphere2, Vec3f(1.5f, 0.5f, 4.0f), Vec3f(0, 0, 0), 1.0f, nullptr, Color(220, 255, 200)),
+        Instance(&sphere3, Vec3f(0.0f, 0.5f, 4.0f), Vec3f(0, 0, 0), 1.0f, nullptr, Color(200, 220, 255))
+	//Instance(&floor, Vec3f(3,-4,8), Vec3f(0,0,0), 1.0f, nullptr, Color(200, 180, 255))
+    };
+
+    Light light = Light(Vec3f(-3.0f, 1.0f, 4.5f), Vec3f(0.0f, 0.0f, 0.0f), Color(255, 255, 255), 0.8f);
+    ShadingParams sp = ShadingParams(0.5f, 1.0f, 0.3f, 32.0f);
+
+    std::cout << "Rendering scene with spheres..." << endl;
+
+    Image img1(W, H);
+    double t1 = RenderAndTime(scene, cam, img1, light, sp, false, "baseline_3d.ppm");
+    ComputeShadowMetrics(img1, t1);  // <-- NEW
+
+    Image img2(W, H);
+    double t2 = RenderAndTime(scene, cam, img2, light, sp, true, "optimized_3d.ppm");
+    ComputeShadowMetrics(img2, t2);  // <-- NEW
+
+    std::cout << "\n=== 3D Benchmark Results ===" << endl;
+    std::cout << "Baseline (no culling): " << t1 << " ms" << endl;
+    std::cout << "Optimized (with culling): " << t2 << " ms" << endl;
+    std::cout << "Speedup: x" << t1/t2 << endl;
+
+    return 0;
+}
